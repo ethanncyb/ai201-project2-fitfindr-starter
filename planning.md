@@ -133,12 +133,29 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| search_listings | No results match the query | |
-| suggest_outfit | Wardrobe is empty | |
-| create_fit_card | Outfit input is missing or incomplete | |
-| search_listings | No results match the query | Returns `[]`; loop sets `session["error"]` naming what was searched and suggesting a fix ("raise your price / drop the size filter"), then stops before `suggest_outfit`. |
+| search_listings | No results match the query | Returns `[]`; loop sets `session["error"]` naming what was searched and suggesting a fix ("raise your price / drop the size filter / different keywords"), then stops before `suggest_outfit`. `fit_card` stays `None`. |
 | suggest_outfit | Wardrobe is empty | Detects empty `items` and returns general styling advice for the item instead of crashing; the flow continues to the fit card. |
-| create_fit_card | Outfit input is missing or incomplete | Guards empty/whitespace `outfit` and returns a clear message ("need an outfit first") as a string — no exception, no blank card. |
+| suggest_outfit | LLM/API call errors (bad key, network, rate limit) | `try/except` catches it and returns a plain fallback string that still names the item, so the loop keeps going. |
+| create_fit_card | Outfit input is missing or incomplete | Guards empty/whitespace `outfit` and returns a clear message ("run suggest_outfit first") as a string — no exception, no blank card. |
+| create_fit_card | LLM/API call errors | `try/except` returns a plain fallback caption naming the item, price, and platform — no exception. |
+
+### Triggered-failure example (captured from testing)
+
+The most useful deterministic failure check is the empty-outfit guard in `create_fit_card`. It does not rely on the model or API key, so it is safe to reproduce and document:
+
+```
+$ ./.venv/bin/python -c "from tools import create_fit_card; print(create_fit_card('', {'title': 'Faded Band Tee', 'price': 22, 'platform': 'Depop'}))"
+Can't write a fit card without an outfit yet — run suggest_outfit first so there's a look to caption.
+```
+
+I also verified the no-results branch in `search_listings`:
+
+```
+$ ./.venv/bin/python -c "from tools import search_listings; print(search_listings('designer ballgown', size='XXS', max_price=5))"
+[]
+```
+
+…and through the agent the user sees: *"No listings matched 'designer ballgown' under $5 in size XXS. Try raising your price, or dropping the size filter, or using different keywords."*
 
 ---
 
@@ -215,6 +232,14 @@ Tool used: **Claude (Claude Code)**, one tool at a time.
 What I reviewed/overrode: added a stopword filter to `_keywords()` so filler words ("looking", "under", "size") don't inflate scores, and wrapped both LLM tools in try/except returning fallback strings so a network/model error never breaks the loop. Tests live in `tests/test_tools.py` (≥1 per failure mode); the LLM tests skip automatically when `GROQ_API_KEY` is unset.
 
 **Milestone 4 — Planning loop and state management:**
+
+Tool used: **Claude (Claude Code)**, given the Architecture diagram + the Planning Loop and State Management sections above.
+
+- **run_agent:** Asked Claude to implement the seven-step loop exactly as diagrammed — parse → search → branch on empty results → select top → suggest → fit card → return — writing every intermediate value into the `session` dict. *Verify before trusting:* (a) it branches on `search_results` rather than calling all three tools unconditionally; (b) the no-results path sets `session["error"]` and returns early with `selected_item`/`outfit_suggestion`/`fit_card` all left `None`; (c) `selected_item is search_results[0]` (same object flows on, no re-fetch). All three confirmed from the terminal.
+- **Query parsing (documented choice):** regex, not the LLM — `_parse_query()` pulls a price ceiling (`under/below/max $N` or a bare `$N`), then a size (`size X` token, or a standalone `XXS/XS/XL/XXL`), and treats the leftover text as the description. Chose regex because it's deterministic, free, and easy to test; the description keywords are forgiving since `search_listings` does its own stopword filtering and scoring.
+- **handle_query (app.py):** Asked Claude to map the returned `session` onto the three panels — guard empty query, pick the wardrobe from the radio, run the agent, route `error` to panel 1 only, else format the listing for panel 1 and pass `outfit_suggestion`/`fit_card` through. Did not touch `build_interface()` or the event wiring.
+
+What I reviewed/overrode: tightened the no-results `error` string so it names the exact criteria searched and the specific fixes (raise price / drop size / different keywords), built from whichever parsed fields were actually present rather than a generic "no results" line.
 
 ---
 
