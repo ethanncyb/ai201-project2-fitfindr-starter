@@ -18,9 +18,18 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import math
 import re
 
-from tools import search_listings, suggest_outfit, create_fit_card, compare_price
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    compare_price,
+    update_style_profile,
+    get_trend_context,
+)
+from utils.style_profile import load_style_profile
 
 
 # ── query parsing ───────────────────────────────────────────────────────────────
@@ -88,10 +97,107 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "selected_item": None,       # top result, passed into suggest_outfit
         "wardrobe": wardrobe,        # user's wardrobe dict
         "price_assessment": None,    # string from compare_price (stretch)
+        "trend_context": None,       # string from get_trend_context (stretch)
+        "style_profile": {},         # loaded from disk at run start
+        "style_profile_update": None,  # summary from update_style_profile
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
+        "search_retry": None,        # note when search succeeded after loosening filters
         "error": None,               # set if the interaction ended early
     }
+
+
+def _format_retry_note(adjustments: list[str], count: int) -> str:
+    """Build a user-facing note explaining which filters were loosened on retry."""
+    joined = "; ".join(adjustments)
+    listing_word = "listing" if count == 1 else "listings"
+    return (
+        f"No exact matches — retried with {joined} and found {count} {listing_word}."
+    )
+
+
+def _search_with_retry(parsed: dict) -> tuple[list, str | None, list[str]]:
+    """
+    Search with progressively looser constraints when the initial query returns nothing.
+
+    Loosening order:
+      1. Drop size filter (keep description + max_price) if a size was specified.
+      2. Raise max_price by 50% (rounded up) if a price ceiling was specified.
+      3. Drop both size and price — description-only — if any filter was active.
+
+    Returns (results, retry_note, attempted_adjustments).
+    retry_note is a non-empty string on successful retry, else None.
+    attempted_adjustments lists every loosening step tried (for exhausted errors).
+    """
+    desc = parsed["description"]
+    orig_size = parsed["size"]
+    orig_max = parsed["max_price"]
+
+    results = search_listings(desc, orig_size, orig_max)
+    if results:
+        return results, None, []
+
+    adjustments: list[str] = []
+    size = orig_size
+    max_price = orig_max
+
+    # 1. Drop size filter.
+    if orig_size:
+        results = search_listings(desc, None, max_price)
+        size = None
+        if results:
+            return results, _format_retry_note(
+                [f"dropped size filter (was {orig_size})"], len(results)
+            ), adjustments
+        adjustments.append(f"dropped size filter (was {orig_size})")
+
+    # 2. Raise price ceiling by 50% (rounded up).
+    if orig_max is not None:
+        raised = math.ceil(orig_max * 1.5)
+        results = search_listings(desc, size, raised)
+        if results:
+            step = f"raised price ceiling to ${raised:.0f} (was ${orig_max:.0f})"
+            note_parts = adjustments + [step] if adjustments else [step]
+            return results, _format_retry_note(note_parts, len(results)), adjustments
+        adjustments.append(
+            f"raised price ceiling to ${raised:.0f} (was ${orig_max:.0f})"
+        )
+
+    # 3. Description-only search (last resort when any filter was active).
+    if orig_size is not None or orig_max is not None:
+        results = search_listings(desc, None, None)
+        if results:
+            step = "removed all filters (description-only search)"
+            note_parts = adjustments + [step] if adjustments else [step]
+            return results, _format_retry_note(note_parts, len(results)), adjustments
+        adjustments.append("removed all filters (description-only search)")
+
+    return [], None, adjustments
+
+
+def _no_results_error(parsed: dict, retry_attempts: list[str]) -> str:
+    """Build an actionable error when search and all retries returned nothing."""
+    bits = [f"'{parsed['description']}'"] if parsed["description"] else []
+    if parsed["max_price"] is not None:
+        bits.append(f"under ${parsed['max_price']:.0f}")
+    if parsed["size"]:
+        bits.append(f"in size {parsed['size']}")
+    criteria = " ".join(bits) if bits else "that query"
+
+    if retry_attempts:
+        tried = ", ".join(retry_attempts)
+        return (
+            f"No listings matched {criteria}. Retried with loosened constraints "
+            f"({tried}) but still found nothing. Try using different keywords."
+        )
+
+    fixes = []
+    if parsed["max_price"] is not None:
+        fixes.append("raising your price")
+    if parsed["size"]:
+        fixes.append("dropping the size filter")
+    fixes.append("using different keywords")
+    return f"No listings matched {criteria}. Try {', or '.join(fixes)}."
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
@@ -144,35 +250,21 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     # Step 1: fresh session — the single source of truth for this run.
     session = _new_session(query, wardrobe)
 
+    # Step 1b: load remembered style preferences from prior sessions.
+    session["style_profile"] = load_style_profile()
+
     # Step 2: parse the query into search arguments.
     session["parsed"] = _parse_query(query)
     parsed = session["parsed"]
 
-    # Step 3: search, then BRANCH on what comes back.
-    session["search_results"] = search_listings(
-        parsed["description"], parsed["size"], parsed["max_price"]
-    )
+    # Step 3: search with automatic retry on empty results, then BRANCH.
+    results, retry_note, retry_attempts = _search_with_retry(parsed)
+    session["search_results"] = results
+    session["search_retry"] = retry_note
 
     if not session["search_results"]:
-        # No-results path: set a specific, actionable error and STOP here.
-        # Do not call suggest_outfit; leave outfit_suggestion and fit_card None.
-        bits = [f"'{parsed['description']}'"] if parsed["description"] else []
-        if parsed["max_price"] is not None:
-            bits.append(f"under ${parsed['max_price']:.0f}")
-        if parsed["size"]:
-            bits.append(f"in size {parsed['size']}")
-        criteria = " ".join(bits) if bits else "that query"
-
-        fixes = []
-        if parsed["max_price"] is not None:
-            fixes.append("raising your price")
-        if parsed["size"]:
-            fixes.append("dropping the size filter")
-        fixes.append("using different keywords")
-
-        session["error"] = (
-            f"No listings matched {criteria}. Try {', or '.join(fixes)}."
-        )
+        # No-results path after retries exhausted: error and STOP here.
+        session["error"] = _no_results_error(parsed, retry_attempts)
         return session
 
     # Step 4: happy path — take the top-ranked listing as the selection.
@@ -181,9 +273,15 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     # Step 4b: assess price against comparable listings in the dataset.
     session["price_assessment"] = compare_price(session["selected_item"])
 
-    # Step 5: style the selected item against the wardrobe.
+    # Step 4c: derive marketplace trend context (optionally scoped to parsed size).
+    session["trend_context"] = get_trend_context(parsed.get("size"))
+
+    # Step 5: style the selected item against the wardrobe and saved profile.
     session["outfit_suggestion"] = suggest_outfit(
-        session["selected_item"], session["wardrobe"]
+        session["selected_item"],
+        session["wardrobe"],
+        style_profile=session["style_profile"],
+        trend_context=session["trend_context"],
     )
 
     # Step 6: turn the outfit into a shareable fit card.
@@ -191,14 +289,22 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         session["outfit_suggestion"], session["selected_item"]
     )
 
-    # Step 7: done.
+    # Step 7: persist learned preferences for future sessions.
+    session["style_profile_update"] = update_style_profile(
+        query, session["selected_item"]
+    )
+
+    # Step 8: done.
     return session
 
 
 # ── CLI test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os
+
     from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+    from utils.style_profile import empty_profile, get_profile_path, save_style_profile
 
     print("=== Happy path: graphic tee ===\n")
     session = run_agent(
@@ -210,12 +316,67 @@ if __name__ == "__main__":
     else:
         print(f"Found: {session['selected_item']['title']}")
         print(f"\nPrice: {session['price_assessment']}")
+        print(f"\nTrends: {session['trend_context']}")
         print(f"\nOutfit: {session['outfit_suggestion']}")
         print(f"\nFit card: {session['fit_card']}")
+        print(f"\nStyle memory: {session['style_profile_update']}")
 
-    print("\n\n=== No-results path ===\n")
+    print("\n\n=== No-results path (retries exhausted) ===\n")
     session2 = run_agent(
         query="designer ballgown size XXS under $5",
         wardrobe=get_example_wardrobe(),
     )
     print(f"Error message: {session2['error']}")
+
+    print("\n\n=== Search retry success (size filter dropped) ===\n")
+    session_retry = run_agent(
+        query="vintage graphic tee size XXS under $30",
+        wardrobe=get_example_wardrobe(),
+    )
+    if session_retry["error"]:
+        print(f"Error: {session_retry['error']}")
+    else:
+        print(f"Search retry note: {session_retry['search_retry']}")
+        print(f"Found: {session_retry['selected_item']['title']}")
+        print(f"Size on listing: {session_retry['selected_item']['size']}")
+
+    print("\n\n=== Style profile memory: two sessions (empty wardrobe) ===\n")
+    demo_profile = get_profile_path().parent / "style_profile_demo.json"
+    os.environ["FITFINDR_PROFILE_PATH"] = str(demo_profile)
+    save_style_profile(empty_profile())
+
+    print("Session 1 — query includes style cues:\n")
+    s1 = run_agent(
+        query=(
+            "vintage graphic tee under $30. "
+            "I mostly wear baggy jeans and chunky sneakers."
+        ),
+        wardrobe=get_empty_wardrobe(),
+    )
+    print(f"Found: {s1['selected_item']['title']}")
+    print(f"Profile update: {s1['style_profile_update']}")
+
+    print("\nSession 2 — new search, no style re-entry:\n")
+    s2 = run_agent(
+        query="90s track jacket under $50",
+        wardrobe=get_empty_wardrobe(),
+    )
+    print(f"Found: {s2['selected_item']['title']}")
+    print(f"Remembered profile: {s2['style_profile'].get('preference_phrases')}")
+    print(f"Outfit (uses memory): {s2['outfit_suggestion'][:200]}...")
+    print(f"Profile update: {s2['style_profile_update']}")
+
+    print("\n\n=== Trend awareness demo ===\n")
+    from tools import get_trend_context
+
+    print("Trend context (size M):")
+    print(get_trend_context("M"))
+    session_trend = run_agent(
+        query="vintage graphic tee under $30, size M",
+        wardrobe=get_example_wardrobe(),
+    )
+    if session_trend["error"]:
+        print(f"Error: {session_trend['error']}")
+    else:
+        print(f"\nTrend context in session: {session_trend['trend_context']}")
+        print(f"Outfit (trends in prompt): {session_trend['outfit_suggestion'][:250]}...")

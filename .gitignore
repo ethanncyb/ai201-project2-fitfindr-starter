@@ -1,6 +1,9 @@
 # API keys — never commit these
 .env
 
+# Per-user style memory (template committed as data/style_profile.default.json)
+data/style_profile.json
+
 # Python
 __pycache__/
 *.py[cod]

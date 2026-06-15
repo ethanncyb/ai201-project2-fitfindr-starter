@@ -11,6 +11,8 @@ Tools:
     suggest_outfit(new_item, wardrobe)              → str
     create_fit_card(outfit, new_item)               → str
     compare_price(item)                             → str   (stretch)
+    update_style_profile(query, selected_item)      → str   (stretch)
+    get_trend_context(size)                         → str   (stretch)
 """
 
 import os
@@ -20,6 +22,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from utils.data_loader import load_listings
+from utils.style_profile import profile_has_content, update_style_profile as _persist_style_profile
 
 load_dotenv()
 
@@ -50,6 +53,26 @@ def _keywords(text: str) -> list[str]:
     """Lowercase, split on non-alphanumerics, and drop stopwords/short tokens."""
     tokens = re.findall(r"[a-z0-9]+", text.lower())
     return [t for t in tokens if t not in _STOPWORDS and len(t) > 1]
+
+
+def _trend_prompt_block(trend_context: str | None) -> str:
+    """Append marketplace trend guidance to an LLM prompt when context is present."""
+    if not trend_context or not trend_context.strip():
+        return ""
+    return (
+        "\n\nCurrent thrift trends (from recent marketplace listings):\n"
+        f"{trend_context.strip()}\n"
+        "Weave at least one of these trends into your suggestion when it fits "
+        "the item — name the trend explicitly."
+    )
+
+
+def _display_tag(tag: str) -> str:
+    """Format a style tag for human-readable trend output."""
+    lowered = tag.lower()
+    if lowered in {"y2k", "90s", "70s", "80s"}:
+        return lowered.upper() if lowered == "y2k" else lowered
+    return tag
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -124,7 +147,12 @@ def search_listings(
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
 
-def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
+def suggest_outfit(
+    new_item: dict,
+    wardrobe: dict,
+    style_profile: dict | None = None,
+    trend_context: str | None = None,
+) -> str:
     """
     Given a thrifted item and the user's wardrobe, suggest 1–2 complete outfits.
 
@@ -132,6 +160,11 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
         new_item: A listing dict (the item the user is considering buying).
         wardrobe: A wardrobe dict with an 'items' key containing a list of
                   wardrobe item dicts. May be empty — handle this gracefully.
+        style_profile: Optional saved preferences from prior sessions. When the
+                  wardrobe is empty but the profile has content, uses remembered
+                  preferences in the prompt instead of generic advice.
+        trend_context: Optional trend summary from get_trend_context(); woven
+                  into the prompt so suggestions reflect current marketplace trends.
 
     Returns:
         A non-empty string with outfit suggestions.
@@ -158,9 +191,26 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
     )
 
     items = wardrobe.get("items", []) if wardrobe else []
+    trend_block = _trend_prompt_block(trend_context)
 
-    if not items:
-        # Empty wardrobe → general styling advice, not a crash.
+    if not items and profile_has_content(style_profile):
+        phrases = ", ".join(style_profile.get("preference_phrases", []))
+        tags = ", ".join(style_profile.get("style_tags", []))
+        colors = ", ".join(style_profile.get("colors", []))
+        prompt = (
+            "You are a thrift-savvy personal stylist.\n"
+            f"A user just found this secondhand item:\n{item_desc}\n\n"
+            "From prior sessions they told you they usually wear: "
+            f"{phrases or 'n/a'}\n"
+            f"Their saved style tags: {tags or 'n/a'}\n"
+            f"Colors they gravitate toward: {colors or 'n/a'}\n\n"
+            "Suggest 1-2 complete outfits built around the new item, naming "
+            "their remembered pieces and preferences by name. Keep it to 2-4 "
+            "sentences, concrete and wearable. Mention a styling tweak if it helps."
+            f"{trend_block}"
+        )
+    elif not items:
+        # Empty wardrobe, no saved profile → general styling advice.
         prompt = (
             "You are a thrift-savvy personal stylist.\n"
             f"A user just found this secondhand item:\n{item_desc}\n\n"
@@ -168,6 +218,7 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
             "advice for this piece in 2-3 sentences: what kinds of pieces pair "
             "well with it, what vibe it suits, and one concrete outfit idea. "
             "Be specific and practical, not a product description."
+            f"{trend_block}"
         )
     else:
         wardrobe_lines = "\n".join(
@@ -184,6 +235,7 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
             "specific pieces from their wardrobe by name. Keep it to 2-4 "
             "sentences, concrete and wearable. Mention a styling tweak (cuff, "
             "tuck, layer) if it helps."
+            f"{trend_block}"
         )
 
     try:
@@ -404,4 +456,142 @@ def compare_price(item: dict) -> str:
         f"{item.get('category', 'items')} in this dataset "
         f"(range {_format_price(low)}–{_format_price(high)} across "
         f"{len(top_comps)} comparables). Comps: {comps_text}."
+    )
+
+
+# ── Stretch: update_style_profile ─────────────────────────────────────────────
+
+def update_style_profile(query: str, selected_item: dict | None) -> str:
+    """
+    Persist style preferences from the query and selected listing to disk.
+
+    Args:
+        query: The original user query (regex extracts style cues).
+        selected_item: Top search result; style_tags/colors are merged in.
+
+    Returns:
+        A non-empty summary string of what was remembered. Never raises.
+    """
+    return _persist_style_profile(query, selected_item)
+
+
+# ── Stretch: get_trend_context ────────────────────────────────────────────────
+
+_CATEGORY_VIBES = {
+    "tops": "graphic tees and tops",
+    "bottoms": "baggy silhouettes and denim",
+    "outerwear": "layering pieces and jackets",
+    "shoes": "chunky sneakers and boots",
+    "accessories": "bags and small accents",
+}
+
+
+def get_trend_context(size: str | None = None) -> str:
+    """
+    Summarize trending style tags from the mock listings dataset.
+
+    Args:
+        size: Optional size filter (loose substring match, same as search).
+              None aggregates trends across all listings.
+
+    Returns:
+        A non-empty human-readable string naming 3-5 trending tags and a brief
+        note about hot categories/platforms. Never raises.
+    """
+    try:
+        listings = load_listings()
+    except Exception:
+        return (
+            "Trend data unavailable — couldn't load the listings dataset. "
+            "Try again later or search without a size filter."
+        )
+
+    if not listings:
+        return (
+            "No listing data available to compute current trends. "
+            "The mock marketplace dataset is empty."
+        )
+
+    if size is not None and size.strip():
+        size_key = size.strip()
+        filtered = [
+            item
+            for item in listings
+            if size_key.lower() in (item.get("size") or "").lower()
+        ]
+        size_label = size_key
+    else:
+        filtered = listings
+        size_label = None
+
+    if not filtered:
+        return (
+            f"No marketplace listings in size {size_label} to derive trends. "
+            "Try dropping the size filter or searching a broader size range."
+        )
+
+    tag_counts: dict[str, int] = {}
+    tag_display: dict[str, str] = {}
+    category_counts: dict[str, int] = {}
+    platform_counts: dict[str, int] = {}
+
+    for item in filtered:
+        for tag in item.get("style_tags", []):
+            if not tag or not str(tag).strip():
+                continue
+            key = str(tag).strip().lower()
+            tag_counts[key] = tag_counts.get(key, 0) + 1
+            tag_display.setdefault(key, str(tag).strip())
+
+        category = item.get("category") or ""
+        if category:
+            category_counts[category] = category_counts.get(category, 0) + 1
+
+        platform = item.get("platform") or ""
+        if platform:
+            platform_counts[platform] = platform_counts.get(platform, 0) + 1
+
+    if not tag_counts:
+        if size_label:
+            return (
+                f"Listings in size {size_label} have no style tags to analyze. "
+                "Trend context is limited for this size in the mock dataset."
+            )
+        return (
+            "Listings in the dataset have no style tags to analyze. "
+            "Trend context is unavailable."
+        )
+
+    ranked_tags = sorted(
+        tag_counts.items(),
+        key=lambda pair: (-pair[1], pair[0]),
+    )
+    top_count = min(5, max(3, len(ranked_tags)))
+    top_tags = [_display_tag(tag_display[key]) for key, _ in ranked_tags[:top_count]]
+    tags_text = ", ".join(top_tags)
+
+    top_categories = sorted(
+        category_counts.items(),
+        key=lambda pair: (-pair[1], pair[0]),
+    )[:2]
+    category_bits = [
+        _CATEGORY_VIBES.get(cat, f"{cat} pieces") for cat, _ in top_categories
+    ]
+    vibe_note = " and ".join(category_bits) if category_bits else "mixed categories"
+
+    top_platform = (
+        max(platform_counts.items(), key=lambda pair: pair[1])[0]
+        if platform_counts
+        else "secondhand apps"
+    )
+
+    if size_label:
+        return (
+            f"Trending in size {size_label} right now: {tags_text} — "
+            f"lots of {vibe_note} on {top_platform}."
+        )
+
+    return (
+        f"Trending across the mock marketplace right now: {tags_text} — "
+        f"lots of {vibe_note} on {top_platform}."
     )

@@ -16,6 +16,7 @@ import gradio as gr
 
 from agent import run_agent
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+from utils.style_profile import format_profile_summary, profile_has_content
 
 
 # ── query handler ─────────────────────────────────────────────────────────────
@@ -68,16 +69,28 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         f"Size: {item['size']}\n"
         f"Brand: {item.get('brand') or 'Unbranded'}\n\n"
         f"{item['description']}\n\n"
-        f"💰 Price check: {session['price_assessment']}"
     )
+    if session.get("search_retry"):
+        listing_text = f"{listing_text}🔁 Search note: {session['search_retry']}\n\n"
+    listing_text = f"{listing_text}💰 Price check: {session['price_assessment']}"
 
-    return listing_text, session["outfit_suggestion"], session["fit_card"]
+    outfit_text = session["outfit_suggestion"] or ""
+    if session.get("trend_context"):
+        outfit_text = f"📈 {session['trend_context']}\n\n{outfit_text}"
+    if profile_has_content(session.get("style_profile")):
+        summary = format_profile_summary(session["style_profile"])
+        outfit_text = f"Using remembered style: {summary}\n\n{outfit_text}"
+    if session.get("style_profile_update"):
+        outfit_text = f"{outfit_text}\n\n📝 {session['style_profile_update']}"
+
+    return listing_text, outfit_text, session["fit_card"]
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
 
 EXAMPLE_QUERIES = [
     "vintage graphic tee under $30",
+    "vintage graphic tee size XXS under $30",  # retry: drops size filter
     "90s track jacket in size M",
     "flowy midi skirt under $40",
     "black combat boots size 8",
