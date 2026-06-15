@@ -91,6 +91,32 @@ Test in isolation:
 python -c "from tools import create_fit_card; print(create_fit_card('', {'title': 'Faded Band Tee', 'price': 22, 'platform': 'Depop'}))"
 ```
 
+### `compare_price(item)` *(stretch)*
+
+| | |
+|---|---|
+| **Inputs** | `item` (`dict`): a listing dict, usually the top search result. |
+| **Returns** | `str`: a price verdict (`Good deal`, `Fair price`, or `Above typical`) with reasoning — median of comparable listings, price range, and 2–3 named comps with their prices. Never raises. |
+| **Purpose** | Pure-Python comparison against similar items in `load_listings()`. Runs on the happy path after a listing is selected; informational only (does not block styling). |
+
+**How comparisons are made:**
+
+1. Exclude the target listing by `id`.
+2. Score every other listing: same `category` required; +2 per shared `style_tag`, +2 for matching `brand`, +1 per shared title keyword (same stopword filter as search).
+3. Take the top 8 scored listings; need at least 2 for a median.
+4. Compare the item's price to the median: ≤85% → Good deal; ≤115% → Fair price; else Above typical.
+5. Return a sentence naming the verdict, median, range, and up to three comparable titles.
+
+Test in isolation:
+
+```bash
+python -c "
+from tools import search_listings, compare_price
+item = search_listings('vintage graphic tee', size=None, max_price=50)[0]
+print(compare_price(item))
+"
+```
+
 ---
 
 ## Planning Loop
@@ -103,7 +129,8 @@ flowchart TD
     Parse --> Search[search_listings]
     Search -->|"results == []"| Error[Set session error and return early]
     Search -->|"results found"| Select["selected_item = results[0]"]
-    Select --> Suggest[suggest_outfit]
+    Select --> PriceCheck[compare_price]
+    PriceCheck --> Suggest[suggest_outfit]
     Suggest --> FitCard[create_fit_card]
     FitCard --> Done[Return session]
 ```
@@ -115,9 +142,10 @@ flowchart TD
 3. **Branch (the decision that matters):**
    - **If** `search_results` is empty → build a criteria-specific `session["error"]` (names description, price, and size when present) and **return early**. `selected_item`, `outfit_suggestion`, and `fit_card` stay `None`. `suggest_outfit` is **not** called.
    - **Else** → `session["selected_item"] = search_results[0]`.
-4. **Suggest:** `suggest_outfit(selected_item, wardrobe)` → `session["outfit_suggestion"]`.
-5. **Fit card:** `create_fit_card(outfit_suggestion, selected_item)` → `session["fit_card"]`.
-6. **Return** the session.
+4. **Price check:** `compare_price(selected_item)` → `session["price_assessment"]`. Informational only — the loop continues even if comparables are thin.
+5. **Suggest:** `suggest_outfit(selected_item, wardrobe)` → `session["outfit_suggestion"]`.
+6. **Fit card:** `create_fit_card(outfit_suggestion, selected_item)` → `session["fit_card"]`.
+7. **Return** the session.
 
 The loop is done when it either hits the early return (error) or fills `fit_card`.
 
@@ -132,15 +160,24 @@ Everything for one interaction lives in a single `session` dict from `_new_sessi
 | `query` | Session start | Reference only |
 | `parsed` | After `_parse_query()` | Arguments to `search_listings` |
 | `search_results` | After search | Branch check; source for `selected_item` |
-| `selected_item` | Top result on happy path | `suggest_outfit`, `create_fit_card` |
+| `selected_item` | Top result on happy path | `compare_price`, `suggest_outfit`, `create_fit_card` |
 | `wardrobe` | Session start | `suggest_outfit` |
+| `price_assessment` | After compare_price | Listing panel (stretch) |
 | `outfit_suggestion` | After suggest | `create_fit_card` |
 | `fit_card` | After fit card | UI panel 3 |
 | `error` | No-results early return | UI panel 1 only |
 
-**State passing example:** `search_results[0]` is stored as `selected_item` and passed unchanged into both `suggest_outfit` and `create_fit_card`. `outfit_suggestion` flows directly into `create_fit_card` without the user typing it again.
+**State passing example:** `search_results[0]` is stored as `selected_item` and passed into `compare_price`, `suggest_outfit`, and `create_fit_card`. `outfit_suggestion` flows directly into `create_fit_card` without the user typing it again.
 
-`handle_query()` in `app.py` calls `run_agent()`, then maps the session to three Gradio panels: listing details, outfit idea, fit card. On error, only the first panel shows the message.
+`handle_query()` in `app.py` calls `run_agent()`, then maps the session to three Gradio panels: listing details (including the price assessment), outfit idea, fit card. On error, only the first panel shows the message.
+
+---
+
+## Stretch Features
+
+### Price Comparison Tool
+
+After a listing is selected, `compare_price()` scores other items in `data/listings.json` by category overlap, shared `style_tags`, brand match, and title keywords. It compares the asking price to the median of the top matches and returns a verdict with named comps — e.g. *"Good deal — Y2K Baby Tee at $18 is below the typical $23 median… Comps: Graphic Tee — 2003 Tour ($24); Vintage Band Tee ($19)."* The assessment appears at the bottom of the listing panel in the Gradio UI and in the CLI happy-path output from `python agent.py`.
 
 ---
 
@@ -220,6 +257,12 @@ python -c "from tools import create_fit_card; print(create_fit_card('', {'title'
 - **AI produced:** Two-branch LLM prompts (named wardrobe pieces vs. general advice), empty-outfit guard returning a string, and Groq calls with `temperature=1.0` on `create_fit_card`.
 - **Reviewed / overridden:** Wrapped both LLM tools in `try/except` returning fallback strings so a network or API error never breaks the loop. Added pytest tests for empty wardrobe, empty outfit, and whitespace-only outfit.
 
+### Instance 4: `compare_price` (stretch)
+
+- **Input given:** Stretch spec from `planning.md` Tool 4 block — comparable scoring (category + style_tags + brand + title keywords), median thresholds, named comps in the return string, and informational-only placement after `selected_item` is set.
+- **AI produced:** `compare_price()` with `_comparable_score()`, median-based verdict tiers, and wiring into `run_agent()` / `handle_query()`.
+- **Reviewed / overridden:** Confirmed the tool never raises and the loop still proceeds when comparables are thin. Added pytest coverage for happy path, missing item, and agent integration (`session["price_assessment"]` populated on success).
+
 ---
 
 ## Running the App
@@ -230,7 +273,7 @@ python app.py
 
 Open the URL shown in your terminal (often `http://localhost:7860`; the port may differ).
 
-**Happy-path query:** `vintage graphic tee under $30` with "Example wardrobe". All three panels populate (listing, outfit idea, fit card).
+**Happy-path query:** `vintage graphic tee under $30` with "Example wardrobe". All three panels populate (listing with price check, outfit idea, fit card).
 
 **Failure query:** `designer ballgown size XXS under $5`, pre-loaded in the example queries. Only the first panel shows the actionable error; outfit and fit card stay empty.
 

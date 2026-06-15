@@ -10,6 +10,7 @@ Tools:
     search_listings(description, size, max_price)  → list[dict]
     suggest_outfit(new_item, wardrobe)              → str
     create_fit_card(outfit, new_item)               → str
+    compare_price(item)                             → str   (stretch)
 """
 
 import os
@@ -278,3 +279,129 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
             f"thrifted the {title} for {price_str} on {platform} — "
             "styling it up and loving it."
         )
+
+
+# ── Stretch: compare_price ────────────────────────────────────────────────────
+
+def _format_price(amount: float) -> str:
+    """Format a dollar amount without trailing .00 when whole."""
+    if amount == int(amount):
+        return f"${int(amount)}"
+    return f"${amount:.2f}"
+
+
+def _comparable_score(target: dict, candidate: dict) -> int:
+    """
+    Score how similar two listings are for price comparison.
+    Higher = more comparable. Same category is required (score 0 otherwise).
+    """
+    if target.get("category") != candidate.get("category"):
+        return 0
+
+    score = 1  # same category baseline
+
+    target_tags = {t.lower() for t in target.get("style_tags", [])}
+    candidate_tags = {t.lower() for t in candidate.get("style_tags", [])}
+    score += len(target_tags & candidate_tags) * 2
+
+    if target.get("brand") and target["brand"] == candidate.get("brand"):
+        score += 2
+
+    target_words = set(_keywords(target.get("title", "")))
+    candidate_words = set(_keywords(candidate.get("title", "")))
+    score += len(target_words & candidate_words)
+
+    return score
+
+
+def compare_price(item: dict) -> str:
+    """
+    Assess whether a listing's price is fair based on comparable items
+    in the mock dataset.
+
+    Args:
+        item: A listing dict (usually the selected search result).
+
+    Returns:
+        A non-empty string with a price verdict and reasoning that cites
+        comparable listings. Never raises.
+
+    Comparables are other listings in the same category, ranked by overlap
+    in style_tags, brand, and title keywords. The assessment compares the
+    item's price to the median of the top comparables.
+    """
+    if not item or not isinstance(item, dict):
+        return (
+            "Can't assess price without a listing to compare. "
+            "Run search_listings first and pass the selected item."
+        )
+
+    price = item.get("price")
+    if not isinstance(price, (int, float)) or price < 0:
+        return (
+            f"Can't assess price for {item.get('title', 'this item')} — "
+            "the listing is missing a valid price."
+        )
+
+    title = item.get("title", "this item")
+    item_id = item.get("id")
+
+    listings = load_listings()
+    scored = []
+    for listing in listings:
+        if item_id and listing.get("id") == item_id:
+            continue
+        score = _comparable_score(item, listing)
+        if score > 0:
+            scored.append((score, listing))
+
+    if not scored:
+        return (
+            f"No comparable listings in the dataset for {title} "
+            f"({_format_price(price)}). Try searching a broader category "
+            "or check similar items manually on other platforms."
+        )
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    # Use the strongest matches; require at least 2 for a median.
+    top_comps = [lst for _, lst in scored[:8]]
+    if len(top_comps) < 2:
+        return (
+            f"Only found one comparable for {title} at {_format_price(price)} "
+            f"({top_comps[0]['title']} at {_format_price(top_comps[0]['price'])}). "
+            "Need at least two similar listings to judge whether the price is fair."
+        )
+
+    comp_prices = sorted(lst["price"] for lst in top_comps)
+    mid = len(comp_prices) // 2
+    if len(comp_prices) % 2:
+        median = comp_prices[mid]
+    else:
+        median = (comp_prices[mid - 1] + comp_prices[mid]) / 2
+
+    low, high = comp_prices[0], comp_prices[-1]
+    price_str = _format_price(price)
+    median_str = _format_price(median)
+
+    if price <= median * 0.85:
+        verdict = "Good deal"
+        detail = f"below the typical {_format_price(median)} median"
+    elif price <= median * 1.15:
+        verdict = "Fair price"
+        detail = f"right around the {_format_price(median)} median"
+    else:
+        verdict = "Above typical"
+        detail = f"higher than the {_format_price(median)} median"
+
+    comp_lines = [
+        f"{lst['title']} ({_format_price(lst['price'])})"
+        for lst in top_comps[:3]
+    ]
+    comps_text = "; ".join(comp_lines)
+
+    return (
+        f"{verdict} — {title} at {price_str} is {detail} for similar "
+        f"{item.get('category', 'items')} in this dataset "
+        f"(range {_format_price(low)}–{_format_price(high)} across "
+        f"{len(top_comps)} comparables). Comps: {comps_text}."
+    )

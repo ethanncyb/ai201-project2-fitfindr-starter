@@ -87,8 +87,28 @@ If `outfit` is empty or whitespace only, return a descriptive error string (e.g.
 
 ### Additional Tools (if any)
 
-<!-- Copy the block above for any tools beyond the required three -->
-None for the required build. Stretch candidates: `compare_price`, `remember_style`, `check_trends`. planning.md gets updated before any of these are started.
+### Tool 4: compare_price (stretch)
+
+**What it does:**
+Given a selected listing, estimates whether its price is fair by comparing it to similar items in the mock dataset. Pure Python — no LLM.
+
+**Input parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `item` | `dict` | A listing dict, usually `session["selected_item"]` after search. |
+
+**What it returns:**
+A non-empty `str` with a verdict (`Good deal`, `Fair price`, or `Above typical`), the item's price vs. the median of comparable listings, the price range across comps, and 2–3 named comparable titles with their prices.
+
+**What happens if it fails or returns nothing:**
+Invalid/missing item or price → returns a descriptive message string (no exception). Fewer than two comparables → explains that a fair-price judgment isn't possible and names the one match if any. No comparables at all → suggests broadening the search. The agent still continues to `suggest_outfit` — price assessment is informational, not a hard stop.
+
+**How comparables are chosen:**
+1. Exclude the target item by `id`.
+2. Score every other listing: same `category` required; +2 per shared `style_tag`, +2 for same `brand`, +1 per shared title keyword (stopword-filtered, same as search).
+3. Take the top 8 scored listings (need ≥2 for a median).
+4. Verdict thresholds vs. median: ≤85% → Good deal; ≤115% → Fair price; else Above typical.
 
 ---
 
@@ -103,9 +123,10 @@ None for the required build. Stretch candidates: `compare_price`, `remember_styl
 2. Call `search_listings(**parsed)`, store in `session["search_results"]`.
 3. **Branch:** if `search_results` is empty → set `session["error"]` to a specific, actionable message and **return early**. `selected_item`, `outfit_suggestion`, and `fit_card` stay `None`.
 4. Otherwise set `session["selected_item"] = search_results[0]`.
-5. Call `suggest_outfit(selected_item, wardrobe)`, store in `session["outfit_suggestion"]`.
-6. Call `create_fit_card(outfit_suggestion, selected_item)`, store in `session["fit_card"]`.
-7. Return the session.
+5. Call `compare_price(selected_item)`, store in `session["price_assessment"]` (informational — does not branch).
+6. Call `suggest_outfit(selected_item, wardrobe)`, store in `session["outfit_suggestion"]`.
+7. Call `create_fit_card(outfit_suggestion, selected_item)`, store in `session["fit_card"]`.
+8. Return the session.
 
 The loop is done when it either hits the early return (error) or fills `fit_card`. The decision that matters is step 3, where empty results take a completely different path than a good search.
 
@@ -119,6 +140,7 @@ The loop is done when it either hits the early return (error) or fills `fit_card
 Everything lives in one `session` dict created by `_new_session()`. It's the single source of truth for the run. Each tool writes its output back into the session, and the next tool reads from it, so the user never re enters anything:
 
 - `search_listings` → writes `search_results`; the loop copies `search_results[0]` into `selected_item`.
+- `compare_price` reads `selected_item` → writes `price_assessment` (shown in the listing panel).
 - `suggest_outfit` reads `selected_item` + `wardrobe` → writes `outfit_suggestion`.
 - `create_fit_card` reads `outfit_suggestion` + `selected_item` → writes `fit_card`.
 - `error` is set only when the loop bails early.
@@ -138,6 +160,8 @@ For each tool, describe the specific failure mode you're handling and what the a
 | suggest_outfit | LLM/API call errors (bad key, network, rate limit) | `try/except` catches it and returns a plain fallback string that still names the item, so the loop keeps going. |
 | create_fit_card | Outfit input is missing or incomplete | Guards empty/whitespace `outfit` and returns a clear message ("run suggest_outfit first") as a string — no exception, no blank card. |
 | create_fit_card | LLM/API call errors | `try/except` returns a plain fallback caption naming the item, price, and platform — no exception. |
+| compare_price | Invalid or missing item/price | Returns a message explaining what's missing; loop continues. |
+| compare_price | Fewer than two comparables in dataset | Returns a message naming the single comp (if any) and that a median can't be computed; loop continues. |
 
 ### Triggered-failure example (captured from testing)
 
@@ -185,6 +209,9 @@ User query  +  wardrobe choice
 │        │ results == [item, ...]                                 │
 │        ▼                                                        │
 │  session["selected_item"] = results[0]                          │
+│        │                                                        │
+│        ▼                                                        │
+│  compare_price(selected_item)  →  session["price_assessment"]   │
 │        │                                                        │
 │        ▼                                                        │
 │  suggest_outfit(selected_item, wardrobe)                        │
@@ -261,12 +288,17 @@ Each tool depends on the one before it. If search returns nothing, the run stops
 - The search returns matching tees sorted by relevance, such as a Y2K butterfly baby tee for $18 on depop.
 - The loop stores the full result list in `session["search_results"]` and copies the top item into `session["selected_item"]`.
 
-**Step 2: Suggest outfit.** 
+**Step 2: Price check (stretch).**
+- `compare_price(selected_item)` finds similar tops in the dataset (shared category + style tags) and compares the $18 asking price to their median (~$23).
+- Returns something like: *"Good deal — Y2K Baby Tee at $18 is below the typical $23 median… Comps: Graphic Tee — 2003 Tour ($24); Vintage Band Tee ($19)."*
+- Stored in `session["price_assessment"]` and shown at the bottom of the listing panel.
+
+**Step 3: Suggest outfit.**
 - `suggest_outfit(selected_item, example_wardrobe)` runs with the chosen tee and the example closet.
 - It returns a suggestion like: *"Tuck the front of the butterfly tee into your baggy straight leg jeans and finish with the chunky white sneakers, then add the black crossbody to keep it light."*
 - The loop stores that string in `session["outfit_suggestion"]`.
 
-**Step 3: Fit card.** 
+**Step 4: Fit card.** 
 - `create_fit_card(outfit_suggestion, selected_item)` turns the outfit into a caption.
 - It might return something like: *"found this y2k butterfly baby tee on depop for $18 and it's already living in my baggy jeans rotation"*
 - The loop stores the caption in `session["fit_card"]`.

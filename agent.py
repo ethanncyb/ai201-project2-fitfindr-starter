@@ -20,7 +20,7 @@ Usage (once implemented):
 
 import re
 
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import search_listings, suggest_outfit, create_fit_card, compare_price
 
 
 # ── query parsing ───────────────────────────────────────────────────────────────
@@ -87,6 +87,7 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "search_results": [],        # list of matching listing dicts
         "selected_item": None,       # top result, passed into suggest_outfit
         "wardrobe": wardrobe,        # user's wardrobe dict
+        "price_assessment": None,    # string from compare_price (stretch)
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
@@ -177,6 +178,9 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     # Step 4: happy path — take the top-ranked listing as the selection.
     session["selected_item"] = session["search_results"][0]
 
+    # Step 4b: assess price against comparable listings in the dataset.
+    session["price_assessment"] = compare_price(session["selected_item"])
+
     # Step 5: style the selected item against the wardrobe.
     session["outfit_suggestion"] = suggest_outfit(
         session["selected_item"], session["wardrobe"]
@@ -205,6 +209,7 @@ if __name__ == "__main__":
         print(f"Error: {session['error']}")
     else:
         print(f"Found: {session['selected_item']['title']}")
+        print(f"\nPrice: {session['price_assessment']}")
         print(f"\nOutfit: {session['outfit_suggestion']}")
         print(f"\nFit card: {session['fit_card']}")
 

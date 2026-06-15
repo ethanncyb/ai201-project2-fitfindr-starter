@@ -12,7 +12,7 @@ import os
 
 import pytest
 
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import search_listings, suggest_outfit, create_fit_card, compare_price
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 _HAS_KEY = bool(os.environ.get("GROQ_API_KEY"))
@@ -99,3 +99,36 @@ def test_create_fit_card_happy_path():
     )
     assert isinstance(card, str)
     assert card.strip() != ""
+
+
+# ── compare_price (stretch) ─────────────────────────────────────────────────
+
+def test_compare_price_returns_assessment():
+    item = search_listings("vintage graphic tee", size=None, max_price=50)[0]
+    assessment = compare_price(item)
+    assert isinstance(assessment, str)
+    assert assessment.strip() != ""
+    # Should cite comparables and a verdict keyword.
+    assert any(
+        word in assessment.lower()
+        for word in ("deal", "fair", "above", "median", "comparable")
+    )
+
+
+def test_compare_price_missing_item():
+    assessment = compare_price({})
+    assert isinstance(assessment, str)
+    assert "listing" in assessment.lower() or "price" in assessment.lower()
+
+
+def test_compare_price_agent_includes_assessment():
+    from agent import run_agent
+    from utils.data_loader import get_example_wardrobe
+
+    session = run_agent(
+        "vintage graphic tee under $30",
+        get_example_wardrobe(),
+    )
+    assert session["error"] is None
+    assert session["price_assessment"]
+    assert isinstance(session["price_assessment"], str)

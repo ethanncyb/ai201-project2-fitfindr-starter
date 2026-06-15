@@ -67,7 +67,8 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         f"${item['price']:.2f} · {item['platform']} · {item['condition']} condition\n"
         f"Size: {item['size']}\n"
         f"Brand: {item.get('brand') or 'Unbranded'}\n\n"
-        f"{item['description']}"
+        f"{item['description']}\n\n"
+        f"💰 Price check: {session['price_assessment']}"
     )
 
     return listing_text, session["outfit_suggestion"], session["fit_card"]
