@@ -206,6 +206,14 @@ The `session` dict threads through every box. Each tool reads the prior result f
 
 **Milestone 3 — Individual tool implementations:**
 
+Tool used: **Claude (Claude Code)**, one tool at a time.
+
+- **search_listings:** Gave Claude the Tool 1 block above (inputs, return type, scoring rule, empty-list failure mode) and asked it to implement the function over `load_listings()` — no re-reading the JSON. *Verify:* confirm it filters by all three params (price ceiling, loose case-insensitive size substring, keyword score), drops zero-score items, sorts highest-first, and returns `[]` rather than raising. *Tested with:* `"vintage graphic tee" / None / $30` (expect the Y2K baby tee on top), `"designer ballgown" / XXS / $5` (expect `[]`), and a `max_price=30` jacket query (assert every result ≤ 30).
+- **suggest_outfit:** Gave Claude the Tool 2 block and the empty-wardrobe requirement, asked it to build two prompt branches (named wardrobe pieces vs. general advice) and call Groq `llama-3.3-70b-versatile`. *Verify:* empty `wardrobe["items"]` takes the general-advice branch, LLM errors are caught and returned as a fallback string, output is never `""`. *Tested with:* example wardrobe and `get_empty_wardrobe()`.
+- **create_fit_card:** Gave Claude the Tool 3 block, asked it to guard empty/whitespace `outfit` with an error string (no exception) and use a higher temperature (1.0) so captions vary. *Verify:* `create_fit_card("", item)` returns a message naming `suggest_outfit`; two runs on the same input produce different text.
+
+What I reviewed/overrode: added a stopword filter to `_keywords()` so filler words ("looking", "under", "size") don't inflate scores, and wrapped both LLM tools in try/except returning fallback strings so a network/model error never breaks the loop. Tests live in `tests/test_tools.py` (≥1 per failure mode); the LLM tests skip automatically when `GROQ_API_KEY` is unset.
+
 **Milestone 4 — Planning loop and state management:**
 
 ---
